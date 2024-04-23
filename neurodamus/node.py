@@ -854,16 +854,17 @@ class Node:
             if SimConfig.restore_coreneuron:
                 continue  # we dont even need to initialize reports
 
-            has_gids = len(self._circuits.global_manager.get_final_gids()) > 0
             # In coreneuron direct (in-memory) mode, i_membrane data is copied
             # between neuron and coreneuron
             if SimConfig.coreneuron_direct_mode and "i_membrane" in rep_params.report_on:
                 Nd.cvode.use_fast_imem(1)
 
-            report = Report(*rep_params, SimConfig.use_coreneuron) if has_gids else None
 
+            report = None
             if not SimConfig.use_coreneuron or rep_params.rep_type == "Synapse":
                 try:
+                    has_gids = len(self._circuits.global_manager.get_final_gids()) > 0
+                    report = Report(*rep_params, SimConfig.use_coreneuron) if has_gids else None
                     self._report_setup(report, rep_conf, target, rep_params.rep_type)
                 except Exception as e:
                     logging.error("Error setting up report '%s': %s", rep_name, e)
@@ -873,9 +874,10 @@ class Node:
             # Custom reporting. TODO: Move `_report_setup` to cellManager.enable_report
             target_population = target_spec.population or self._target_spec.population
             cell_manager = self._circuits.get_node_manager(target_population)
-            cell_manager.enable_report(report, target, SimConfig.use_coreneuron)
+            # cell_manager.enable_report(report, target, SimConfig.use_coreneuron)
 
-            self._report_list.append(report)
+            if report:
+                self._report_list.append(report)
 
         if n_errors > 0:
             raise Exception("%d reporting errors detected. Terminating" % (n_errors,))
