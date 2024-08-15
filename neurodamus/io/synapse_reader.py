@@ -8,7 +8,9 @@ import libsonata
 import numpy as np
 
 from ..core import NeurodamusCore as Nd, MPI
+from ..core import ProgressBarRank0 as ProgressBar
 from ..utils.logging import log_verbose
+from ..utils.pyutils import gen_ranges
 
 
 def _constrained_hill(K_half, y):
@@ -206,7 +208,7 @@ class SonataReader(SynapseReader):
     SYNAPSE_INDEX_NAMES = ("synapse_index",)
     LOOKUP_BY_TARGET_IDS = True  # False to lookup by Source Ids
     Parameters = SynapseParameters  # By default we load synapses
-    EMPTY_COUNT = {}
+    EMPTY_DATA = {}
 
     custom_parameters = {"isec", "ipt", "offset"}
     """Custom parameters are skipped from direct loading and trigger _load_params_custom()"""
@@ -253,10 +255,21 @@ class SonataReader(SynapseReader):
         """
         return self._data[gid][field_name]
 
-    def preload_data(self, ids):
-        """Preload SONATA fields for the specified IDs"""
+    def preload_data(self, gids, minimal_mode=False):
+        """
+        Preload SONATA fields for the specified IDs.
+        Set minimal_mode to True to read a single synapse per connection
+        """
+        # Ensure we dont ask synapses for more than 50 target cells at once
+        CHUNK_SIZE = 50
+        ranges = list(gen_ranges(len(gids), CHUNK_SIZE))
+        for start, end in ProgressBar.iter(ranges, name="Prefetching"):
+            self._preload_data_chunk(gids[start:end], minimal_mode)
+
+    def _preload_data_chunk(self, gids, minimal_mode=False):
         compute_fields = set(("sgid", "tgid") + self.SYNAPSE_INDEX_NAMES)
-        needed_ids = sorted(set(ids) - set(self._data.keys()))
+        orig_needed_ids_set = set(gids) - set(self._data.keys())
+        needed_ids = sorted(orig_needed_ids_set)
 
         def get_edge_and_lookup_gids(needed_ids):
             gids_0based = np.array(needed_ids, dtype="int64") - 1
@@ -269,6 +282,15 @@ class SonataReader(SynapseReader):
 
         needed_edge_ids, lookup_gids = get_edge_and_lookup_gids(needed_ids)
 
+        # Find and exclude gids without data
+        needed_ids = np.diff(lookup_gids, prepend=np.nan).nonzero()[0]
+        for gid in (orig_needed_ids_set - set(needed_ids)):
+            self._data.setdefault(gid, self.EMPTY_DATA)
+
+        del orig_needed_ids_set
+        if needed_ids.size == 0:
+            return
+
         def _populate(field, data):
             # Populate cache. Unavailable entries are stored as a plain -1
             if data is None:
@@ -279,7 +301,12 @@ class SonataReader(SynapseReader):
 
         def _read(attribute, optional=False):
             if attribute in self._population.attribute_names:
-                return self._population.get_attribute(attribute, needed_edge_ids)
+                if minimal_mode and attribute not in ("sgid", "tgid"):
+                    # The first entry will be used, and stored as a scalar
+                    first_index = needed_edge_ids.ranges[0][0]
+                    return self._population.get_attribute(attribute, first_index)
+                else:
+                    return self._population.get_attribute(attribute, needed_edge_ids)
             elif optional:
                 log_verbose("Defaulting to -1.0 for attribute %s", attribute)
                 return -1
@@ -288,9 +315,19 @@ class SonataReader(SynapseReader):
 
         # Populate the opposite node id
         if self.LOOKUP_BY_TARGET_IDS:
-            _populate("sgid", self._population.source_nodes(needed_edge_ids) + 1)
+            counter_gids_property_name = "sgid"
+            counter_gids = self._population.source_nodes(needed_edge_ids) + 1
         else:
-            _populate("tgid", self._population.target_nodes(needed_edge_ids) + 1)
+            counter_gids_property_name = "tgid"
+            counter_gids = self._population.target_nodes(needed_edge_ids) + 1
+
+        if minimal_mode:
+            unique_conn_edges_i = np.diff(counter_gids, prepend=np.nan).nonzero()[0]
+            counter_gids = counter_gids[unique_conn_edges_i]
+            lookup_gids = lookup_gids[unique_conn_edges_i]
+            needed_edge_ids = libsonata.Selection(needed_edge_ids.flatten()[unique_conn_edges_i])
+
+        _populate(counter_gids_property_name, counter_gids)
 
         # Make synapse index in the file explicit
         for name in sorted(self.SYNAPSE_INDEX_NAMES):
@@ -311,7 +348,7 @@ class SonataReader(SynapseReader):
         # We nevertheless can skip any base fields
         extra_fields = set(self._extra_fields) - (self.Parameters.all_fields | compute_fields)
         for field in sorted(extra_fields):
-            now_needed_ids = sorted(set(gid for gid in ids if field not in self._data[gid]))
+            now_needed_ids = sorted(set(gid for gid in gids if field not in self._data[gid]))
             if needed_ids != now_needed_ids:
                 needed_ids = now_needed_ids
                 needed_edge_ids, lookup_gids = get_edge_and_lookup_gids(needed_ids)
@@ -358,10 +395,14 @@ class SonataReader(SynapseReader):
                 _populate("offset", _read("morpho_offset_segment_post"))
 
     def _load_synapse_parameters(self, gid):
-        if gid not in self._data:
-            self.preload_data([gid])
+        data = self._data.get(gid)
+        if data is None:
+            self._preload_data_chunk([gid])
+            data = self._data[gid]
 
-        data = self._data[gid]
+        if len(data) == 0:
+            return self.Parameters.empty  # disconnected cell
+
         edge_count = len(next(iter(data.values())))
 
         if self._extra_fields:
@@ -417,7 +458,7 @@ class SonataReader(SynapseReader):
                 tgid_counts = {tgt_src_pairs["f1"][j]: counts[j] for j in range(start_i, end_i)}
                 self._counts[tgid] = tgid_counts
 
-        return {tgid: self._counts.get(tgid, self.EMPTY_COUNT) for tgid in tgids}
+        return {tgid: self._counts.get(tgid, self.EMPTY_DATA) for tgid in tgids}
 
 
 class FormatNotSupported(Exception):
